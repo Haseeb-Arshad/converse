@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const WebSocket = require('ws');
 const http = require('http');
+const { generateAISuggestions, generateRealTimeSuggestions } = require('./ai-suggestions');
 require('dotenv').config();
 
 const app = express();
@@ -211,6 +212,37 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     activeConnections: activeConnections.size
   });
+});
+
+// API endpoint for AI suggestions
+app.post('/api/ai-suggestions', async (req, res) => {
+  try {
+    const { currentText, conversationHistory, realTime = false } = req.body;
+    
+    if (!currentText) {
+      return res.status(400).json({
+        error: 'currentText is required'
+      });
+    }
+
+    let suggestions;
+    if (realTime) {
+      suggestions = await generateRealTimeSuggestions(currentText, conversationHistory);
+    } else {
+      suggestions = await generateAISuggestions(currentText, conversationHistory);
+    }
+
+    res.json({
+      suggestions,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Error generating AI suggestions:', error);
+    res.status(500).json({
+      error: 'Failed to generate suggestions',
+      message: error.message
+    });
+  }
 });
 
 // API endpoint to validate AssemblyAI API key

@@ -28,6 +28,14 @@ interface ConnectionStatus {
   message: string;
 }
 
+interface AISuggestion {
+  id: string;
+  text: string;
+  confidence: number;
+  type: 'completion' | 'correction' | 'context' | 'next_word';
+  reasoning: string;
+}
+
 export default function Home() {
   const [isRecording, setIsRecording] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>({ connected: false, message: 'Initializing...' });
@@ -39,6 +47,9 @@ export default function Home() {
   const [audioLevel, setAudioLevel] = useState(0);
   const [wordCount, setWordCount] = useState(0);
   const [sessionDuration, setSessionDuration] = useState(0);
+  const [aiSuggestions, setAiSuggestions] = useState<AISuggestion[]>([]);
+  const [showSuggestions, setShowSuggestions] = useState(true);
+  const [conversationContext, setConversationContext] = useState<string[]>([]);
 
   // Audio recording refs
   const audioStreamRef = useRef<MediaStream | null>(null);
@@ -59,7 +70,7 @@ export default function Home() {
       return;
     }
 
-    const ws = new WebSocket('ws://localhost:8081');
+    const ws = new WebSocket('ws://localhost:8080');
     websocketRef.current = ws;
 
     ws.onopen = () => {
@@ -131,11 +142,20 @@ export default function Home() {
           if (data.end_of_turn && data.turn_is_formatted) {
             // Final formatted transcript
             setTranscripts(prev => [...prev, data]);
+            setConversationContext(prev => [...prev, data.transcript].slice(-10)); // Keep last 10 sentences
             setCurrentTranscript('');
             setWordCount(prev => prev + (data.words?.length || 0));
+            
+            // Generate AI suggestions based on context
+            generateAISuggestions(data.transcript, conversationContext);
           } else {
             // Live transcript - ultra-fast updates
             setCurrentTranscript(data.transcript);
+            
+            // Generate real-time suggestions for incomplete sentences
+            if (data.transcript.length > 3) {
+              generateRealTimeSuggestions(data.transcript);
+            }
           }
         }
         break;
@@ -143,9 +163,10 @@ export default function Home() {
       case 'Termination':
         setSessionInfo(null);
         setCurrentTranscript('');
+        setAiSuggestions([]);
         break;
     }
-  }, []);
+  }, [conversationContext]);
 
   const startRecording = async () => {
     try {
@@ -256,34 +277,74 @@ export default function Home() {
   };
 
   const stopRecording = useCallback(() => {
-    if (audioStreamRef.current) {
-      audioStreamRef.current.getTracks().forEach(track => track.stop());
+    console.log('🛑 Stopping recording...');
+    
+    // First set recording to false to stop audio processing
+    setIsRecording(false);
+    setCurrentTranscript('');
+    setAudioLevel(0);
 
+    if (audioStreamRef.current) {
+      // Stop all audio tracks immediately
+      audioStreamRef.current.getTracks().forEach(track => {
+        track.stop();
+        console.log('🔇 Stopped audio track:', track.kind);
+      });
+
+      // Clean up audio processing components
       const audioContext = (audioStreamRef.current as any).audioContext;
       const processor = (audioStreamRef.current as any).processor;
+      const source = (audioStreamRef.current as any).source;
+      const analyser = (audioStreamRef.current as any).analyser;
 
+      // Disconnect all audio nodes
       if (processor) {
         try {
           processor.disconnect();
+          processor.onaudioprocess = null; // Remove event handler
+          console.log('🔌 Disconnected audio processor');
         } catch (error) {
-          // Ignore cleanup errors
+          console.warn('Error disconnecting processor:', error);
         }
       }
 
+      if (source) {
+        try {
+          source.disconnect();
+          console.log('🔌 Disconnected audio source');
+        } catch (error) {
+          console.warn('Error disconnecting source:', error);
+        }
+      }
+
+      if (analyser) {
+        try {
+          analyser.disconnect();
+          console.log('🔌 Disconnected analyser');
+        } catch (error) {
+          console.warn('Error disconnecting analyser:', error);
+        }
+      }
+
+      // Close audio context
       if (audioContext && audioContext.state !== 'closed') {
-        audioContext.close().catch(() => { });
+        audioContext.close().then(() => {
+          console.log('🔇 Closed audio context');
+        }).catch((error: any) => {
+          console.warn('Error closing audio context:', error);
+        });
       }
 
       audioStreamRef.current = null;
     }
 
+    // Send terminate message to server
     if (websocketRef.current?.readyState === WebSocket.OPEN) {
       websocketRef.current.send(JSON.stringify({ type: 'terminate' }));
+      console.log('📤 Sent terminate message to server');
     }
 
-    setIsRecording(false);
-    setCurrentTranscript('');
-    setAudioLevel(0);
+    console.log('✅ Recording stopped successfully');
   }, []);
 
   const clearTranscripts = () => {
@@ -338,31 +399,356 @@ export default function Home() {
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
+  // Local fallback suggestions when OpenAI API is unavailable
+  const generateLocalFallbackSuggestions = (text: string, context: string[]): AISuggestion[] => {
+    const suggestions: AISuggestion[] = [];
+    const words = text.toLowerCase().split(' ');
+    const timestamp = Date.now();
+    const randomSuffix = Math.random().toString(36).substring(2, 8);
+
+    // Enhanced patterns for full sentence suggestions
+    const patterns = [
+      {
+        triggers: ['i am', 'my name is'],
+        suggestions: [
+          'working on a new project that involves advanced technology',
+          'building something really exciting and innovative for users',
+          'developing a solution that will help people communicate better',
+          'currently focused on creating something meaningful and impactful'
+        ],
+        confidence: 0.85
+      },
+      {
+        triggers: ['working on'],
+        suggestions: [
+          'a project that combines technology and creativity seamlessly',
+          'building this application to solve real problems for users',
+          'developing something that will make a significant difference',
+          'creating a system that can help many people worldwide'
+        ],
+        confidence: 0.90
+      },
+      {
+        triggers: ['building'],
+        suggestions: [
+          'this application to demonstrate the incredible power of AI',
+          'a system that can understand and respond naturally to speech',
+          'something that will revolutionize how we communicate with technology',
+          'an innovative solution for real-time transcription and analysis'
+        ],
+        confidence: 0.88
+      },
+      {
+        triggers: ['this is'],
+        suggestions: [
+          'working really well and I am excited about the results',
+          'an amazing demonstration of what is possible with modern technology',
+          'exactly what I was hoping to achieve with this project',
+          'a perfect example of how AI can enhance human communication'
+        ],
+        confidence: 0.82
+      },
+      {
+        triggers: ['hello', 'hi', 'hey'],
+        suggestions: [
+          'everyone, I am excited to show you what we have been working on',
+          'there, I hope you are having a great day today',
+          'and welcome to this demonstration of our new technology',
+          'I wanted to share something really interesting with you all'
+        ],
+        confidence: 0.80
+      },
+      {
+        triggers: ['today'],
+        suggestions: [
+          'I want to demonstrate how this AI transcription system works',
+          'we are going to explore the capabilities of real-time speech processing',
+          'I am excited to show you the future of voice technology',
+          'let us see how well this system can understand natural speech'
+        ],
+        confidence: 0.83
+      }
+    ];
+
+    // Find matching patterns
+    let suggestionIndex = 0;
+    for (const pattern of patterns) {
+      for (const trigger of pattern.triggers) {
+        if (text.toLowerCase().includes(trigger)) {
+          pattern.suggestions.forEach((suggestion) => {
+            suggestions.push({
+              id: `fallback-${timestamp}-${randomSuffix}-${suggestionIndex++}`,
+              text: suggestion,
+              confidence: pattern.confidence - (suggestionIndex * 0.02),
+              type: 'completion',
+              reasoning: `Sentence completion after "${trigger}"`
+            });
+          });
+          break;
+        }
+      }
+    }
+
+    return suggestions.slice(0, 4); // Limit to 4 suggestions
+  };
+
+  // AI Suggestion Functions using OpenAI GPT-4o-mini
+  const generateAISuggestions = useCallback(async (currentText: string, context: string[]) => {
+    try {
+      console.log('🤖 Generating AI suggestions for:', currentText);
+      
+      const response = await fetch('http://localhost:8080/api/ai-suggestions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          currentText,
+          conversationHistory: context,
+          realTime: false
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = await response.json();
+      console.log('✅ Received AI suggestions:', data.suggestions);
+      
+      // Ensure unique IDs for all suggestions
+      const uniqueSuggestions = data.suggestions.map((suggestion: AISuggestion, index: number) => ({
+        ...suggestion,
+        id: `ai-${Date.now()}-${Math.random().toString(36).substring(2, 8)}-${index}`
+      }));
+      
+      setAiSuggestions(uniqueSuggestions);
+    } catch (error) {
+      console.error('❌ Error generating AI suggestions:', error);
+      // Fallback to local suggestions if API fails
+      const fallbackSuggestions = generateLocalFallbackSuggestions(currentText, context);
+      setAiSuggestions(fallbackSuggestions);
+    }
+  }, []);
+
+  const generateRealTimeSuggestions = useCallback(async (partialText: string) => {
+    try {
+      // Only generate suggestions for substantial text to avoid too many API calls
+      if (partialText.split(' ').length < 3) {
+        return;
+      }
+
+      // Throttle suggestions to avoid overwhelming the system
+      const now = Date.now();
+      if (now - (generateRealTimeSuggestions as any).lastCall < 3000) {
+        return;
+      }
+      (generateRealTimeSuggestions as any).lastCall = now;
+
+      console.log('⚡ Generating real-time suggestions for:', partialText);
+      
+      const response = await fetch('http://localhost:8080/api/ai-suggestions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          currentText: partialText,
+          conversationHistory: conversationContext,
+          realTime: true
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = await response.json();
+      console.log('⚡ Received real-time suggestions:', data.suggestions);
+      setAiSuggestions(data.suggestions);
+    } catch (error) {
+      console.error('❌ Error generating real-time suggestions:', error);
+      // Fallback to local suggestions if API fails
+      const fallbackSuggestions = generateLocalFallbackSuggestions(partialText, conversationContext);
+      setAiSuggestions(fallbackSuggestions);
+    }
+  }, [conversationContext]);
+
+  const analyzeContextAndGenerateSuggestions = async (text: string, context: string[]): Promise<AISuggestion[]> => {
+    // Simulate AI processing delay
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    const suggestions: AISuggestion[] = [];
+    const words = text.toLowerCase().split(' ');
+    const lastWord = words[words.length - 1];
+    const contextText = context.join(' ').toLowerCase();
+
+    // Context-based suggestions
+    if (text.includes('building') || contextText.includes('building')) {
+      suggestions.push({
+        id: 'ctx-1',
+        text: 'application',
+        confidence: 0.92,
+        type: 'context',
+        reasoning: 'Based on context about building projects'
+      });
+      suggestions.push({
+        id: 'ctx-2',
+        text: 'system',
+        confidence: 0.88,
+        type: 'context',
+        reasoning: 'Common follow-up in technical discussions'
+      });
+    }
+
+    if (text.includes('working') || contextText.includes('working')) {
+      suggestions.push({
+        id: 'ctx-3',
+        text: 'on',
+        confidence: 0.95,
+        type: 'next_word',
+        reasoning: 'Most common word after "working"'
+      });
+      suggestions.push({
+        id: 'ctx-4',
+        text: 'with',
+        confidence: 0.87,
+        type: 'next_word',
+        reasoning: 'Alternative continuation'
+      });
+    }
+
+    // Name-based suggestions
+    if (text.includes('I am') || text.includes('my name')) {
+      suggestions.push({
+        id: 'name-1',
+        text: 'Asif',
+        confidence: 0.96,
+        type: 'completion',
+        reasoning: 'Detected name introduction pattern'
+      });
+    }
+
+    // Technical context suggestions
+    if (contextText.includes('transcription') || contextText.includes('ai')) {
+      suggestions.push({
+        id: 'tech-1',
+        text: 'real-time',
+        confidence: 0.91,
+        type: 'context',
+        reasoning: 'Technical context about transcription'
+      });
+      suggestions.push({
+        id: 'tech-2',
+        text: 'processing',
+        confidence: 0.85,
+        type: 'context',
+        reasoning: 'Related to AI/transcription workflow'
+      });
+    }
+
+    return suggestions.slice(0, 4); // Limit to 4 suggestions
+  };
+
+  const generateCompletionSuggestions = async (partialText: string): Promise<AISuggestion[]> => {
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    const suggestions: AISuggestion[] = [];
+    const words = partialText.toLowerCase().split(' ');
+    const lastWord = words[words.length - 1];
+
+    // Word completion suggestions
+    if (lastWord.startsWith('build')) {
+      suggestions.push({
+        id: 'comp-1',
+        text: 'building',
+        confidence: 0.94,
+        type: 'completion',
+        reasoning: 'Word completion for "build"'
+      });
+    }
+
+    if (lastWord.startsWith('work')) {
+      suggestions.push({
+        id: 'comp-2',
+        text: 'working',
+        confidence: 0.96,
+        type: 'completion',
+        reasoning: 'Word completion for "work"'
+      });
+    }
+
+    if (lastWord.startsWith('thi')) {
+      suggestions.push({
+        id: 'comp-3',
+        text: 'this',
+        confidence: 0.98,
+        type: 'completion',
+        reasoning: 'Word completion for "thi"'
+      });
+    }
+
+    // Common phrase completions
+    if (partialText.endsWith('I am')) {
+      suggestions.push({
+        id: 'phrase-1',
+        text: 'working on',
+        confidence: 0.89,
+        type: 'completion',
+        reasoning: 'Common phrase completion'
+      });
+    }
+
+    return suggestions.slice(0, 3);
+  };
+
+  const applySuggestion = (suggestion: AISuggestion) => {
+    console.log('Applied suggestion:', suggestion.text);
+    
+    // Add the suggestion to the current transcript
+    setCurrentTranscript(prev => {
+      const trimmed = prev.trim();
+      if (trimmed.endsWith('.') || trimmed.endsWith('!') || trimmed.endsWith('?')) {
+        // If current transcript is complete, add as new sentence
+        return `${trimmed} ${suggestion.text}`;
+      } else {
+        // If incomplete, complete the current sentence
+        return `${trimmed} ${suggestion.text}`;
+      }
+    });
+    
+    // Clear suggestions after applying one
+    setAiSuggestions([]);
+    
+    // Add to conversation context
+    setConversationContext(prev => [...prev, suggestion.text].slice(-10));
+  };
+
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-50 via-white to-slate-100 dark:from-slate-950 dark:via-slate-900 dark:to-slate-800">
-      {/* Glassmorphism Header */}
-      <div className="sticky top-0 z-50 backdrop-blur-xl bg-white/70 dark:bg-slate-900/70 border-b border-slate-200/50 dark:border-slate-700/50">
-        <div className="max-w-4xl mx-auto px-6 py-4">
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-blue-50/30 dark:from-gray-950 dark:via-gray-900 dark:to-blue-950/30">
+      {/* Apple-inspired Header */}
+      <div className="sticky top-0 z-50 backdrop-blur-2xl bg-white/80 dark:bg-gray-900/80 border-b border-gray-200/30 dark:border-gray-700/30">
+        <div className="max-w-5xl mx-auto px-8 py-5">
           <div className="flex items-center justify-between">
-            <div className="flex items-center space-x-3">
-              <div className="w-8 h-8 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center">
-                <Zap className="w-4 h-4 text-white" />
+            <div className="flex items-center space-x-4">
+              <div className="w-10 h-10 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-2xl flex items-center justify-center shadow-lg shadow-blue-500/25">
+                <Zap className="w-5 h-5 text-white" />
               </div>
               <div>
-                <h1 className="text-xl font-semibold text-slate-900 dark:text-white">
-                  Live Transcription
+                <h1 className="text-2xl font-semibold text-gray-900 dark:text-white tracking-tight">
+                  Converse
                 </h1>
-                <p className="text-sm text-slate-500 dark:text-slate-400">
-                  Ultra-fast speech-to-text
+                <p className="text-sm text-gray-500 dark:text-gray-400 font-medium">
+                  AI-Powered Real-time Transcription
                 </p>
               </div>
             </div>
 
-            <div className="flex items-center space-x-2">
+            <div className="flex items-center space-x-3">
               {/* Connection Status */}
-              <div className="flex items-center space-x-2 px-3 py-1.5 rounded-full bg-slate-100 dark:bg-slate-800">
-                <div className={`w-2 h-2 rounded-full ${connectionStatus.connected ? 'bg-green-500' : 'bg-red-500'}`}></div>
-                <span className="text-xs font-medium text-slate-600 dark:text-slate-300">
+              <div className="flex items-center space-x-3 px-4 py-2 rounded-full bg-gray-100/80 dark:bg-gray-800/80 backdrop-blur-sm">
+                <div className={`w-2.5 h-2.5 rounded-full ${connectionStatus.connected ? 'bg-green-500 shadow-lg shadow-green-500/50' : 'bg-red-500 shadow-lg shadow-red-500/50'}`}></div>
+                <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
                   {connectionStatus.connected ? 'Connected' : 'Disconnected'}
                 </span>
               </div>
@@ -370,9 +756,9 @@ export default function Home() {
               {/* Settings Button */}
               <button
                 onClick={() => setShowSettings(!showSettings)}
-                className="p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                className="p-3 rounded-xl hover:bg-gray-100/80 dark:hover:bg-gray-800/80 transition-all duration-200 hover:scale-105"
               >
-                <Settings className="w-4 h-4 text-slate-600 dark:text-slate-400" />
+                <Settings className="w-5 h-5 text-gray-600 dark:text-gray-400" />
               </button>
             </div>
           </div>
@@ -417,6 +803,30 @@ export default function Home() {
                 <span className="text-sm text-slate-500">{settings.min_end_of_turn_silence_when_confident}ms</span>
               </div>
             </div>
+            
+            {/* AI Suggestions Toggle */}
+            <div className="mt-6 pt-6 border-t border-slate-200/50 dark:border-slate-700/50">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h4 className="text-sm font-medium text-slate-700 dark:text-slate-300">AI Suggestions</h4>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                    Show contextual word and phrase suggestions powered by AI
+                  </p>
+                </div>
+                <button
+                  onClick={() => setShowSuggestions(!showSuggestions)}
+                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                    showSuggestions ? 'bg-blue-600' : 'bg-slate-200 dark:bg-slate-700'
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                      showSuggestions ? 'translate-x-6' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
+              </div>
+            </div>
           </div>
         )}
 
@@ -434,23 +844,23 @@ export default function Home() {
             <button
               onClick={isRecording ? stopRecording : startRecording}
               disabled={!connectionStatus.connected}
-              className={`relative w-24 h-24 rounded-full transition-all duration-300 transform hover:scale-105 ${isRecording
-                  ? 'bg-gradient-to-br from-red-500 to-red-600 shadow-2xl shadow-red-500/30'
-                  : 'bg-gradient-to-br from-blue-500 to-purple-600 shadow-2xl shadow-blue-500/30'
-                } ${!connectionStatus.connected ? 'opacity-50 cursor-not-allowed' : 'hover:shadow-3xl'}`}
+              className={`relative w-28 h-28 rounded-full transition-all duration-500 transform hover:scale-110 active:scale-95 ${isRecording
+                  ? 'bg-gradient-to-br from-red-500 via-red-600 to-red-700 shadow-2xl shadow-red-500/40'
+                  : 'bg-gradient-to-br from-blue-500 via-indigo-600 to-purple-700 shadow-2xl shadow-blue-500/40'
+                } ${!connectionStatus.connected ? 'opacity-50 cursor-not-allowed' : 'hover:shadow-3xl'} backdrop-blur-sm border border-white/20`}
             >
               {isRecording ? (
-                <MicOff className="w-8 h-8 text-white mx-auto" />
+                <MicOff className="w-9 h-9 text-white mx-auto drop-shadow-lg" />
               ) : (
-                <Mic className="w-8 h-8 text-white mx-auto" />
+                <Mic className="w-9 h-9 text-white mx-auto drop-shadow-lg" />
               )}
 
               {/* Audio Level Indicator */}
               {isRecording && (
-                <div className="absolute inset-0 rounded-full border-4 border-white/30 animate-pulse"
+                <div className="absolute inset-0 rounded-full border-3 border-white/40 animate-pulse"
                   style={{
-                    transform: `scale(${1 + audioLevel * 0.3})`,
-                    opacity: 0.7 + audioLevel * 0.3
+                    transform: `scale(${1 + audioLevel * 0.4})`,
+                    opacity: 0.8 + audioLevel * 0.2
                   }}>
                 </div>
               )}
@@ -458,11 +868,11 @@ export default function Home() {
 
             {/* Pulse Animation */}
             {isRecording && (
-              <div className="absolute inset-0 rounded-full bg-red-500/20 animate-ping"></div>
+              <div className="absolute inset-0 rounded-full bg-red-500/30 animate-ping"></div>
             )}
           </div>
 
-          <p className="mt-4 text-slate-600 dark:text-slate-400">
+          <p className="mt-6 text-gray-600 dark:text-gray-400 font-medium">
             {isRecording ? 'Recording... Tap to stop' : 'Tap to start recording'}
           </p>
 
@@ -480,16 +890,85 @@ export default function Home() {
           )}
         </div>
 
-        {/* Live Transcript */}
+        {/* Live Transcript with AI Suggestions */}
         {currentTranscript && (
-          <div className="mb-8 p-6 rounded-2xl bg-gradient-to-br from-yellow-50 to-orange-50 dark:from-yellow-900/20 dark:to-orange-900/20 border border-yellow-200/50 dark:border-yellow-800/50 backdrop-blur-sm">
-            <div className="flex items-center space-x-2 mb-3">
-              <div className="w-2 h-2 bg-yellow-500 rounded-full animate-pulse"></div>
-              <span className="text-sm font-medium text-yellow-800 dark:text-yellow-200">Live</span>
+          <div className="mb-8 relative">
+            <div className="p-6 rounded-2xl bg-gradient-to-br from-yellow-50 to-orange-50 dark:from-yellow-900/20 dark:to-orange-900/20 border border-yellow-200/50 dark:border-yellow-800/50 backdrop-blur-sm">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center space-x-2">
+                  <div className="w-2 h-2 bg-yellow-500 rounded-full animate-pulse"></div>
+                  <span className="text-sm font-medium text-yellow-800 dark:text-yellow-200">Live Transcription</span>
+                </div>
+                {showSuggestions && aiSuggestions.length > 0 && (
+                  <div className="flex items-center space-x-2">
+                    <div className="w-1.5 h-1.5 bg-blue-500 rounded-full animate-pulse"></div>
+                    <span className="text-xs font-medium text-blue-600 dark:text-blue-400">AI Suggestions</span>
+                  </div>
+                )}
+              </div>
+              
+              <div className="relative">
+                <p className="text-lg text-slate-900 dark:text-white leading-relaxed">
+                  {currentTranscript}
+                  {isRecording && (
+                    <span className="inline-block w-0.5 h-5 bg-blue-500 ml-1 animate-pulse"></span>
+                  )}
+                </p>
+                
+        {/* AI Suggestions - Clean Bottom Popup like the image */}
+        {showSuggestions && aiSuggestions.length > 0 && (
+          <div className="fixed inset-0 z-50 flex items-end justify-center p-4 bg-black/20 backdrop-blur-sm">
+            <div className="w-full max-w-md bg-gray-900/95 backdrop-blur-xl rounded-3xl border border-gray-700/50 shadow-2xl animate-slide-up">
+              {/* Header */}
+              <div className="px-6 py-4 border-b border-gray-700/50">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-lg font-semibold text-white">CREATIVE SUGGESTIONS</h3>
+                  <button
+                    onClick={() => setAiSuggestions([])}
+                    className="text-gray-400 hover:text-white transition-colors"
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+              
+              {/* Suggestions List */}
+              <div className="px-6 py-4 space-y-4 max-h-96 overflow-y-auto">
+                {aiSuggestions.map((suggestion, index) => {
+                  const uniqueKey = `${suggestion.id || 'suggestion'}-${index}-${suggestion.text.slice(0, 10)}`;
+                  return (
+                    <button
+                      key={uniqueKey}
+                      onClick={() => applySuggestion(suggestion)}
+                      className="w-full text-left p-4 rounded-2xl bg-gray-800/50 hover:bg-gray-700/50 border border-gray-700/30 hover:border-gray-600/50 transition-all duration-200 group"
+                    >
+                      <div className="mb-2">
+                        <h4 className="text-white font-medium text-base leading-relaxed">
+                          {suggestion.text}
+                        </h4>
+                      </div>
+                      <p className="text-gray-400 text-sm">
+                        Click to use
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
+              
+              {/* Footer */}
+              <div className="px-6 py-4 border-t border-gray-700/50">
+                <button
+                  onClick={() => setAiSuggestions([])}
+                  className="w-full text-center text-gray-400 hover:text-white transition-colors font-medium"
+                >
+                  Dismiss
+                </button>
+              </div>
             </div>
-            <p className="text-lg text-slate-900 dark:text-white leading-relaxed">
-              {currentTranscript}
-            </p>
+          </div>
+        )}
+              </div>
+            </div>
           </div>
         )}
 
